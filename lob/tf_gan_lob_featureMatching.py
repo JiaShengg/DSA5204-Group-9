@@ -35,14 +35,6 @@ lob_data = scaler.fit_transform(df[lob_features].values).astype(np.float32)
 lob_dataset = tf.data.Dataset.from_tensor_slices(lob_data).batch(config.batch_size)
 
 
-import tensorflow as tf
-from tensorflow.keras import layers, models
-import numpy as np
-import pandas as pd
-from sklearn.preprocessing import MinMaxScaler
-import os
-import time
-
 class Generator(models.Model):
     """Simple Generator that transforms noise into a 40-dimensional feature vector with financial constraints"""
     def __init__(self, config):
