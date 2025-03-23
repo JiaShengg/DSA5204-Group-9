@@ -4,25 +4,24 @@ import numpy as np
 import os
 import time
 import pandas as pd
-import tensorflow as tf
-import numpy as np
 from sklearn.preprocessing import MinMaxScaler
 import matplotlib.pyplot as plt
-
+import datetime
+import random
 
 # ==========================================================================================
 # config and data
 # ==========================================================================================
 
-
 class Config:
-    z_dim = 40*100  # Dimension of random noise
+    z_dim = 40 * 100
     batch_size = 32
     learning_rate_g = 0.0002
     learning_rate_d = 0.0002
-    feature_matching_weight = 1
+    adv_weight = 1
     epochs = 20
-    penalty_weight = 5
+    label_smoothing = 0.1
+    lambda_order = 4
 
 config = Config()
 
@@ -39,7 +38,6 @@ lob_features = [
 df = df.dropna(subset=lob_features).sample(n=5000, random_state=42)
 scaler = MinMaxScaler()
 lob_data = scaler.fit_transform(df[lob_features].values).astype(np.float32)
-
 lob_dataset = tf.data.Dataset.from_tensor_slices(lob_data).batch(config.batch_size)
 
 # ==========================================================================================
@@ -47,234 +45,189 @@ lob_dataset = tf.data.Dataset.from_tensor_slices(lob_data).batch(config.batch_si
 # ==========================================================================================
 
 class Generator(models.Model):
-    """Simple Generator that transforms noise into a 40-dimensional feature vector with financial constraints"""
     def __init__(self, config):
         super(Generator, self).__init__()
-        self.config = config
-        self.z_dim = config.z_dim
-        
-        self.dense1 = layers.Dense(128, activation='relu')
-        self.dense2 = layers.Dense(64, activation='relu')
+        self.dense1 = layers.Dense(512)
+        self.bn1 = layers.BatchNormalization()
+        self.leaky_relu1 = layers.LeakyReLU(0.2)
+
+        self.dense2 = layers.Dense(256)
+        self.bn2 = layers.BatchNormalization()
+        self.leaky_relu2 = layers.LeakyReLU(0.2)
+
+        self.dense3 = layers.Dense(128)
+        self.bn3 = layers.BatchNormalization()
+        self.leaky_relu3 = layers.LeakyReLU(0.2)
+
+        self.dense4 = layers.Dense(64)
+        self.bn4 = layers.BatchNormalization()
+        self.leaky_relu4 = layers.LeakyReLU(0.2)
+
         self.output_layer = layers.Dense(40, activation='tanh')
-    
-    def apply_penalties(self, lob_output):
-        penalties = tf.zeros_like(lob_output)
-
-        # Ensure non-negative prices and quantities
-        penalties += tf.nn.softplus(-lob_output)
-
-        # Ensure bid prices are descending
-        bid_prices = lob_output[:, :10]
-        bid_diff = bid_prices[:, 1:] - bid_prices[:, :-1]
-        bid_penalties = tf.nn.softplus(bid_diff)
-
-        # Ensure ask prices are ascending
-        ask_prices = lob_output[:, 20:30]
-        ask_diff = ask_prices[:, 1:] - ask_prices[:, :-1]
-        ask_penalties = tf.nn.softplus(-ask_diff)
-
-        # Ensure bid and ask quantities are non-negative
-        batch_size = tf.shape(lob_output)[0]
-
-        # Create index tensors for updates
-        bid_q_indices = tf.range(10, 20)  # Shape (10,)
-        ask_q_indices = tf.range(30, 40)  # Shape (10,)
-
-        # Expand batch dimension
-        batch_indices = tf.range(batch_size)[:, None]  # Shape (batch_size, 1)
-
-        bid_q_indices = tf.tile(bid_q_indices[None, :], [batch_size, 1])  # Shape (batch_size, 10)
-        ask_q_indices = tf.tile(ask_q_indices[None, :], [batch_size, 1])  # Shape (batch_size, 10)
-
-        bid_q_indices = tf.stack([tf.tile(batch_indices, [1, 10]), bid_q_indices], axis=-1)
-        ask_q_indices = tf.stack([tf.tile(batch_indices, [1, 10]), ask_q_indices], axis=-1)
-
-        bid_q_indices = tf.reshape(bid_q_indices, [-1, 2])
-        ask_q_indices = tf.reshape(ask_q_indices, [-1, 2])
-
-        bid_q_penalties = tf.reshape(tf.nn.softplus(-lob_output[:, 10:20]), [-1])
-        ask_q_penalties = tf.reshape(tf.nn.softplus(-lob_output[:, 30:40]), [-1])
-
-        penalties = tf.tensor_scatter_nd_add(penalties, bid_q_indices, bid_q_penalties)
-        penalties = tf.tensor_scatter_nd_add(penalties, ask_q_indices, ask_q_penalties)
-
-        # Ensure Best Bid - Best Ask is negative
-        max_bid = tf.math.reduce_logsumexp(bid_prices, axis=1, keepdims=True)
-        min_ask = -tf.math.reduce_logsumexp(-ask_prices, axis=1, keepdims=True)
-        bid_ask_violation = tf.nn.softplus(min_ask - max_bid)
-
-        return config.penalty_weight*penalties, bid_ask_violation + tf.reduce_sum(bid_penalties) + tf.reduce_sum(ask_penalties)
 
     def call(self, inputs, training=True):
-        x = self.dense1(inputs)
-        x = self.dense2(x)
-        lob_output = self.output_layer(x)
-        penalties, bid_ask_violation = self.apply_penalties(lob_output)
-        return lob_output, tf.reduce_sum(penalties, axis=1) + bid_ask_violation
+        x = self.leaky_relu1(self.bn1(self.dense1(inputs), training=training))
+        x = self.leaky_relu2(self.bn2(self.dense2(x), training=training))
+        x = self.leaky_relu3(self.bn3(self.dense3(x), training=training))
+        x = self.leaky_relu4(self.bn4(self.dense4(x), training=training))
+        return self.output_layer(x)
 
 # ==========================================================================================
 # discriminator
 # ==========================================================================================
 
+class MinibatchDiscrimination(layers.Layer):
+    def __init__(self, num_kernels=50, kernel_dim=5):
+        super().__init__()
+        self.num_kernels = num_kernels
+        self.kernel_dim = kernel_dim
+
+    def build(self, input_shape):
+        self.T = self.add_weight(
+            name="T",
+            shape=(input_shape[-1], self.num_kernels * self.kernel_dim),
+            initializer="glorot_uniform",
+            trainable=True
+        )
+
+    def call(self, x):
+        M = tf.matmul(x, self.T)
+        M = tf.reshape(M, [-1, self.num_kernels, self.kernel_dim])
+        diffs = tf.expand_dims(M, 3) - tf.expand_dims(tf.transpose(M, [1, 2, 0]), 0)
+        abs_diffs = tf.reduce_sum(tf.abs(diffs), axis=2)
+        minibatch_features = tf.reduce_sum(tf.exp(-abs_diffs), axis=2)
+        return tf.concat([x, minibatch_features], axis=1)
+
 class Discriminator(models.Model):
-    """Simple Discriminator for classifying real vs fake feature vectors with financial constraints"""
-    def __init__(self, config):
+    def __init__(self):
         super(Discriminator, self).__init__()
-        self.config = config
-        
-        self.dense1 = layers.Dense(128, activation='relu', input_shape=(40,))
-        self.dense2 = layers.Dense(64, activation='relu')
-        self.feature_layer = layers.Dense(32, activation='relu')
-        self.output_layer = layers.Dense(1)
-    
-    def apply_penalties(self, lob_output):
-        penalties = tf.zeros_like(lob_output)
+        self.dense1 = layers.Dense(512)
+        self.leaky_relu1 = layers.LeakyReLU(0.2)
 
-        # Ensure non-negative prices and quantities
-        penalties += tf.nn.softplus(-lob_output)
+        self.dense2 = layers.Dense(256)
+        self.leaky_relu2 = layers.LeakyReLU(0.2)
 
-        # Ensure bid prices are descending
-        bid_prices = lob_output[:, :10]
-        bid_diff = bid_prices[:, 1:] - bid_prices[:, :-1]
-        bid_penalties = tf.nn.softplus(bid_diff)
+        self.dense3 = layers.Dense(128)
+        self.leaky_relu3 = layers.LeakyReLU(0.2)
 
-        # Ensure ask prices are ascending
-        ask_prices = lob_output[:, 20:30]
-        ask_diff = ask_prices[:, 1:] - ask_prices[:, :-1]
-        ask_penalties = tf.nn.softplus(-ask_diff)
+        self.dense4 = layers.Dense(64)
+        self.leaky_relu4 = layers.LeakyReLU(0.2)
 
-        # Ensure bid and ask quantities are non-negative
-        batch_size = tf.shape(lob_output)[0]
+        self.feature_layer = layers.Dense(32)
+        self.leaky_relu5 = layers.LeakyReLU(0.2)
 
-        # Create index tensors for updates
-        bid_q_indices = tf.range(10, 20)  # Shape (10,)
-        ask_q_indices = tf.range(30, 40)  # Shape (10,)
+        self.minibatch = MinibatchDiscrimination()
+        self.output_layer = layers.Dense(1, activation='sigmoid')
 
-        # Expand batch dimension
-        batch_indices = tf.range(batch_size)[:, None]  # Shape (batch_size, 1)
-
-        bid_q_indices = tf.tile(bid_q_indices[None, :], [batch_size, 1])  # Shape (batch_size, 10)
-        ask_q_indices = tf.tile(ask_q_indices[None, :], [batch_size, 1])  # Shape (batch_size, 10)
-
-        bid_q_indices = tf.stack([tf.tile(batch_indices, [1, 10]), bid_q_indices], axis=-1)
-        ask_q_indices = tf.stack([tf.tile(batch_indices, [1, 10]), ask_q_indices], axis=-1)
-
-        bid_q_indices = tf.reshape(bid_q_indices, [-1, 2])
-        ask_q_indices = tf.reshape(ask_q_indices, [-1, 2])
-
-        bid_q_penalties = tf.reshape(tf.nn.softplus(-lob_output[:, 10:20]), [-1])
-        ask_q_penalties = tf.reshape(tf.nn.softplus(-lob_output[:, 30:40]), [-1])
-
-        penalties = tf.tensor_scatter_nd_add(penalties, bid_q_indices, bid_q_penalties)
-        penalties = tf.tensor_scatter_nd_add(penalties, ask_q_indices, ask_q_penalties)
-
-        # Ensure Best Bid - Best Ask is negative
-        max_bid = tf.math.reduce_logsumexp(bid_prices, axis=1, keepdims=True)
-        min_ask = -tf.math.reduce_logsumexp(-ask_prices, axis=1, keepdims=True)
-        bid_ask_violation = tf.nn.softplus(min_ask - max_bid)
-
-        return config.penalty_weight*penalties, bid_ask_violation + tf.reduce_sum(bid_penalties) + tf.reduce_sum(ask_penalties)
-    
     def call(self, inputs, training=True, return_features=False):
-        penalties, bid_ask_violation = self.apply_penalties(inputs)
-        x = self.dense1(inputs)
-        x = self.dense2(x)
-        features = self.feature_layer(x)
-        output = self.output_layer(features)
-        if return_features:
-            return output, features, tf.reduce_sum(penalties, axis=1) + bid_ask_violation
-        return output
+        x = self.leaky_relu1(self.dense1(inputs))
+        x = self.leaky_relu2(self.dense2(x))
+        x = self.leaky_relu3(self.dense3(x))
+        x = self.leaky_relu4(self.dense4(x))
+        features = self.leaky_relu5(self.feature_layer(x))
+        x = self.minibatch(features)
+        output = self.output_layer(x)
+        return (output, features) if return_features else output
 
 # ==========================================================================================
 # feature matching
 # ==========================================================================================
 
+# class FeatureMatching:
+#     def __init__(self, sharpness=10.0):
+#         self.sharpness = sharpness
+
+#     def __call__(self, real_features, fake_features):
+#         def prob_less_matrix(x):
+#             x_i = tf.expand_dims(x, axis=2)
+#             x_j = tf.expand_dims(x, axis=1)
+#             prob_matrix = tf.sigmoid(self.sharpness * (x_j - x_i))
+#             return tf.reduce_mean(tf.exp(prob_matrix), axis=0)
+
+#         real_matrix = prob_less_matrix(real_features)
+#         fake_matrix = prob_less_matrix(fake_features)
+
+#         match_loss = tf.reduce_mean((tf.square(real_matrix - fake_matrix)))
+#         return match_loss
+
 class FeatureMatching:
-    """Feature matching loss combining full feature comparison and bid-offer spread"""
     def __call__(self, real_features, fake_features):
-        # Compute overall mean feature matching
-        real_mean = tf.reduce_mean(real_features, axis=0)
-        fake_mean = tf.reduce_mean(fake_features, axis=0)
-        full_feature_loss = tf.reduce_mean(tf.square(real_mean - fake_mean))
-        
-        # Compute bid-offer spread for real and fake data
-        real_bid_prices = real_features[:, :10]  # First 10 columns are bid prices
-        real_ask_prices = real_features[:, 20:30]  # Columns 20-30 are ask prices
-        real_spread = real_ask_prices - real_bid_prices  # Spread at each level
-        real_spread_mean = tf.reduce_mean(real_spread, axis=0)  # Mean across batch
+        # L2 normalize each feature vector (row-wise)
+        real_norm = tf.math.l2_normalize(real_features, axis=1)  # (batch, dim)
+        fake_norm = tf.math.l2_normalize(fake_features, axis=1)  # (batch, dim)
 
-        fake_bid_prices = fake_features[:, :10]
-        fake_ask_prices = fake_features[:, 20:30]
-        fake_spread = fake_ask_prices - fake_bid_prices
-        fake_spread_mean = tf.reduce_mean(fake_spread, axis=0)
+        # Compute squared pairwise differences: ||x_i - y_j||^2 = ||x_i||^2 + ||y_j||^2 - 2 x_i • y_j
+        # Since x_i and y_j are normalized, their norms are 1, so ||x_i - y_j||^2 = 2 - 2 * (x_i • y_j)
+        dot_products = tf.matmul(real_norm, fake_norm, transpose_b=True)  # (batch, batch)
+        sq_distances = 2.0 - 2.0 * dot_products  # element-wise squared distance matrix
 
-        # Compute feature matching loss based on spread difference
-        spread_feature_loss = tf.reduce_mean(tf.square(real_spread_mean - fake_spread_mean))
-        
-        # Combine both losses
-        return full_feature_loss + spread_feature_loss
+        # Take the mean over all (i, j)
+        return tf.reduce_mean(sq_distances)
+
+
+
 
 # ==========================================================================================
 # GAN
 # ==========================================================================================
 
 class SimpleGAN:
-    """Simplest GAN with Feature Matching and Financial Constraints"""
     def __init__(self, config):
         self.config = config
-        
         self.generator = Generator(config)
-        self.discriminator = Discriminator(config)
+        self.discriminator = Discriminator()
         self.feature_matching = FeatureMatching()
-        
-        self.gen_optimizer = tf.keras.optimizers.Adam(config.learning_rate_g)
-        self.disc_optimizer = tf.keras.optimizers.Adam(config.learning_rate_d)
-        
-        self.fixed_noise = tf.random.normal([16, config.z_dim])
+        self.gen_optimizer = tf.keras.optimizers.Adam(config.learning_rate_g, beta_1=0.5)
+        self.disc_optimizer = tf.keras.optimizers.Adam(config.learning_rate_d, beta_1=0.5)
+        self.global_step = 0
 
-    def generator_loss(self, fake_output, fake_penalties, real_features, fake_features):
-        target = tf.ones_like(fake_output)
-        adv_loss = tf.reduce_mean(tf.keras.losses.binary_crossentropy(target, fake_output, from_logits=True))
+    def generator_loss(self, fake_output, real_features, fake_features):
+        bce = tf.keras.losses.BinaryCrossentropy()
+        adv_loss = bce(tf.ones_like(fake_output) * (1.0 - self.config.label_smoothing), fake_output)
+        
         fm_loss = self.feature_matching(real_features, fake_features)
-        return adv_loss + self.config.feature_matching_weight * fm_loss + tf.reduce_mean(fake_penalties)
+
+        return fm_loss + self.config.adv_weight * adv_loss
 
     def discriminator_loss(self, real_output, fake_output):
-        real_labels = tf.ones_like(real_output)
-        fake_labels = tf.zeros_like(fake_output)
-        real_loss = tf.reduce_mean(tf.keras.losses.binary_crossentropy(real_labels, real_output, from_logits=True))
-        fake_loss = tf.reduce_mean(tf.keras.losses.binary_crossentropy(fake_labels, fake_output, from_logits=True))
+        bce = tf.keras.losses.BinaryCrossentropy()
+        real_loss = bce(tf.ones_like(real_output) * (1.0 - self.config.label_smoothing), real_output)
+        fake_loss = bce(tf.zeros_like(fake_output), fake_output)
         return real_loss + fake_loss
-    
-    @tf.function
-    def train_step(self, real_matrices):
-        batch_size = tf.shape(real_matrices)[0]
-        noise = tf.random.normal([batch_size, self.config.z_dim])
-        
-        with tf.GradientTape() as disc_tape:
-            fake_matrices, fake_penalties = self.generator(noise, training=True)
-            real_output, real_features, _ = self.discriminator(real_matrices, training=True, return_features=True)
-            fake_output, fake_features, _ = self.discriminator(fake_matrices, training=True, return_features=True)
-            disc_loss = self.discriminator_loss(real_output, fake_output)
-        
-        disc_gradients = disc_tape.gradient(disc_loss, self.discriminator.trainable_variables)
-        self.disc_optimizer.apply_gradients(zip(disc_gradients, self.discriminator.trainable_variables))
-        
-        with tf.GradientTape() as gen_tape:
-            fake_matrices, fake_penalties = self.generator(noise, training=True)
-            fake_output, fake_features, _ = self.discriminator(fake_matrices, training=True, return_features=True)
-            gen_loss = self.generator_loss(fake_output, fake_penalties, real_features, fake_features)
-        
-        gen_gradients = gen_tape.gradient(gen_loss, self.generator.trainable_variables)
-        self.gen_optimizer.apply_gradients(zip(gen_gradients, self.generator.trainable_variables))
-        
-        return {"gen_loss": gen_loss, "disc_loss": disc_loss}
 
-    
+    @tf.function
+    def train_step(self, real_data):
+        batch_size = tf.shape(real_data)[0]
+        noise = tf.random.normal([batch_size, self.config.z_dim])
+
+        with tf.GradientTape() as disc_tape:
+            fake_data = self.generator(noise, training=True)
+            real_output, real_features = self.discriminator(real_data, training=True, return_features=True)
+            fake_output, fake_features = self.discriminator(fake_data, training=True, return_features=True)
+            d_loss = self.discriminator_loss(real_output, fake_output)
+
+        disc_grads = disc_tape.gradient(d_loss, self.discriminator.trainable_variables)
+        self.disc_optimizer.apply_gradients(zip(disc_grads, self.discriminator.trainable_variables))
+
+        with tf.GradientTape() as gen_tape:
+            fake_data = self.generator(noise, training=True)
+            fake_output, fake_features = self.discriminator(fake_data, training=True, return_features=True)
+            g_loss = self.generator_loss(fake_output, real_features, fake_features)
+
+        gen_grads = gen_tape.gradient(g_loss, self.generator.trainable_variables)
+        self.gen_optimizer.apply_gradients(zip(gen_grads, self.generator.trainable_variables))
+
+        self.global_step += 1
+
+        return {"gen_loss": g_loss, "disc_loss": d_loss}
+
     def train(self, dataset, epochs):
         for epoch in range(epochs):
             for batch in dataset:
                 metrics = self.train_step(batch)
-            print(f"Epoch {epoch+1}/{epochs} - Generator Loss: {metrics['gen_loss']:.4f}, Discriminator Loss: {metrics['disc_loss']:.4f}")
+            print(f"Epoch {epoch+1}/{epochs} - Gen Loss: {metrics['gen_loss']:.4f}, Disc Loss: {metrics['disc_loss']:.4f}")
+
+
 
 # ==========================================================================================
 # reasonability check functions
@@ -314,51 +267,39 @@ def compute_faulty_rate(lob_tensor):
     return faulty_rate.numpy()  # Convert to NumPy for further processing
 
 def plot_order_book_scatter(lob_sample):
-    """Scatter plot of a single LOB snapshot with price vs. quantity and level labels."""
-
-    # Extract bid and ask prices and sizes
     bid_prices = np.array(lob_sample[:10])
     bid_sizes = np.array(lob_sample[10:20])
     ask_prices = np.array(lob_sample[20:30])
     ask_sizes = np.array(lob_sample[30:40])
 
-    # Remove negative or zero values to ensure valid plotting
-    valid_bids = bid_sizes > 0
-    valid_asks = ask_sizes > 0
-    bid_prices, bid_sizes = bid_prices[valid_bids], bid_sizes[valid_bids]
-    ask_prices, ask_sizes = ask_prices[valid_asks], ask_sizes[valid_asks]
-
+    # Remove log/exp transformations and show raw price & quantity
     plt.figure(figsize=(8, 5))
 
-    # Scatter plot for bids and asks
-    plt.scatter(bid_sizes, bid_prices, color='blue', label="Bids", alpha=0.6)
-    plt.scatter(ask_sizes, ask_prices, color='red', label="Asks", alpha=0.6)
+    plt.scatter(bid_prices, bid_sizes, color='blue', label="Bids", alpha=0.6)
+    plt.scatter(ask_prices, ask_sizes, color='red', label="Asks", alpha=0.6)
 
-    # Annotate each price level with its index
-    for i, (q, p) in enumerate(zip(bid_sizes, bid_prices)):
-        plt.annotate(f"b{i}", (q, p), fontsize=10, color='blue', ha="right")
-    
-    for i, (q, p) in enumerate(zip(ask_sizes, ask_prices)):
-        plt.annotate(f"a{i}", (q, p), fontsize=10, color='red', ha="left")
+    for i, (p, q) in enumerate(zip(bid_prices, bid_sizes)):
+        plt.annotate(f"b{i}", (p, q), fontsize=10, color='blue', ha="right")
 
-    # Adjust x-axis and y-axis dynamically
-    max_quantity = max(np.max(bid_sizes) if len(bid_sizes) > 0 else 0,
-                       np.max(ask_sizes) if len(ask_sizes) > 0 else 0) * 1.1
-    min_price = min(np.min(bid_prices) if len(bid_prices) > 0 else np.inf,
-                    np.min(ask_prices) if len(ask_prices) > 0 else np.inf) /1.1
-    max_price = max(np.max(bid_prices) if len(bid_prices) > 0 else -np.inf,
-                    np.max(ask_prices) if len(ask_prices) > 0 else -np.inf) *1.1
+    for i, (p, q) in enumerate(zip(ask_prices, ask_sizes)):
+        plt.annotate(f"a{i}", (p, q), fontsize=10, color='red', ha="left")
 
-    plt.xlim(0, max_quantity)
-    plt.ylim(min_price, max_price)
+    min_price = min(np.min(bid_prices), np.min(ask_prices)) * 0.99
+    max_price = max(np.max(bid_prices), np.max(ask_prices)) * 1.01
 
-    plt.xlabel("Quantity")
-    plt.ylabel("Price")
-    plt.title("LOB Scatter Plot (Price vs. Quantity)")
+    min_qty = min(np.min(bid_sizes), np.min(ask_sizes)) * 0.99
+    max_qty = max(np.max(bid_sizes), np.max(ask_sizes)) * 1.01
 
+    plt.xlim(min_price, max_price)
+    plt.ylim(min_qty, max_qty)
+
+    plt.xlabel("Price")
+    plt.ylabel("Quantity")
+    plt.title("LOB Scatter Plot (Original Scale)")
     plt.legend()
     plt.grid(True)
-    plt.show()
+    # plt.show()
+
 
 
 # ==========================================================================================
@@ -369,7 +310,7 @@ gan = SimpleGAN(config)
 gan.train(lob_dataset, config.epochs)
 
 noise = tf.random.normal([100, config.z_dim])
-generated_samples, _ = gan.generator(noise, training=False)  # Ignore the penalties
+generated_samples = gan.generator(noise, training=False)  # Ignore the penalties
 generated_samples = generated_samples.numpy()
 # Convert back to original scale
 generated_samples = scaler.inverse_transform(generated_samples.reshape(100, -1))
@@ -380,16 +321,23 @@ generated_samples = scaler.inverse_transform(generated_samples.reshape(100, -1))
 
 faulty_rates = np.array([compute_faulty_rate(tf.convert_to_tensor(sample.reshape(1, -1), dtype=tf.float32)) for sample in generated_samples])
 
-# Plot histogram of faulty rates
+# Create the directory if it doesn't exist
+save_dir = "/Users/xuyunpeng/Documents/NUS/DSA5204/proj/GAN_LOB_Project/plots3"
+os.makedirs(save_dir, exist_ok=True)
+
+# 1. Save histogram of faulty rates
+timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 plt.figure(figsize=(8, 5))
 plt.hist(faulty_rates, bins=20, edgecolor='black', alpha=0.7)
 plt.xlabel("Faulty Rate")
 plt.ylabel("Frequency")
 plt.title("Histogram of Faulty Rates in Generated LOB Data")
 plt.grid(True)
-plt.show()
 
-# Save to CSV
+hist_filename = f"hist_faulty_rates_{timestamp}.png"
+plt.savefig(os.path.join(save_dir, hist_filename))
+
+# 2. Save the first generated LOB sample to CSV
 single_lob_sample = generated_samples[0]  # Choose the first generated sample
 
 # Define column names for LOB structure
@@ -405,7 +353,21 @@ df_single_lob = pd.DataFrame([single_lob_sample], columns=lob_columns)
 
 # Save as CSV
 df_single_lob.to_csv("single_generated_lob.csv", index=False)
-print("first sample saved to 'single_generated_lob.csv'")
+print("First sample saved to 'single_generated_lob.csv'")
 
-for i in range(5):
-    plot_order_book_scatter(generated_samples[i])
+# 3. Plot and save scatter plots of order books
+random_indices = random.sample(range(100), 5)
+
+for i in random_indices:
+    # Generate scatter plot
+    plot_order_book_scatter(generated_samples[i])  
+    
+    # Get timestamp for unique naming
+    current_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # Construct filename
+    scatter_filename = f"order_book_scatter_{i}_{current_timestamp}.png"
+    
+    # Save figure
+    plt.savefig(os.path.join(save_dir, scatter_filename))
+
