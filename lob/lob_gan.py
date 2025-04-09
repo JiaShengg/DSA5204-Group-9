@@ -32,9 +32,9 @@ class Configs:
     sample_size: int = 20_000
     n_batches: int = 16
     epochs: int = 64
+    seed: int = 0
 
 
-N_FIXED_NOISE = 4
 Z_DIM = 128
 
 
@@ -62,8 +62,7 @@ def create_dataset(raw_data, sample_size, batch_size,
     return (
         tf.data.Dataset
         .from_tensor_slices(dataf.values.astype(np.float32))
-        .batch(batch_size)
-        # .shuffle(batch_size, seed=random_state, reshuffle_each_iteration=True)
+        .batch(batch_size, num_parallel_calls=tf.data.AUTOTUNE, deterministic=True)
         .prefetch(tf.data.AUTOTUNE)
     )
 
@@ -123,7 +122,7 @@ def plot_training_history(metrics):
             ax.set_yscale('log')
 
     plot_cols(axes[0], ['gen_loss', 'adv_loss', 'fm_loss'], True)
-    plot_cols(axes[1], ['disc_loss'], True)
+    plot_cols(axes[1], ['disc_loss', 'real_loss', 'fake_loss'], True)
     plot_cols(axes[2], ['real_prob', 'fake_prob'])
     plot_cols(axes[3], ['neg_qty_sum', 'neg_diff_sum'], True)
     plot_cols(axes[4], ['neg_qty_count', 'neg_diff_count'], True)
@@ -156,10 +155,10 @@ def calculate_sample_stats(batch) -> dict:
         )
     )
     return dict(
-        neg_qty_sum=neg_qty_sum,
-        neg_qty_count=neg_qty_count,
-        neg_diff_sum=neg_diff_sum,
-        neg_diff_count=neg_diff_count,
+        neg_qty_sum=float(neg_qty_sum),
+        neg_qty_count=float(neg_qty_count),
+        neg_diff_sum=float(neg_diff_sum),
+        neg_diff_count=float(neg_diff_count),
     )
 
 
@@ -212,7 +211,7 @@ def calculate_feature_matching_loss(real_lobs, fake_lobs):
 class Generator(models.Model):
     def __init__(self, config):
         super().__init__()
-        activation = 'softplus'
+        activation = 'relu'
         self.px_net = models.Sequential([
             layers.Dense(64, activation=activation, use_bias=False),
             layers.Dense(64, activation=activation, use_bias=False),
@@ -235,19 +234,19 @@ class Generator(models.Model):
 class Discriminator(models.Model):
     def __init__(self, config):
         super().__init__()
-        activation = 'softplus'
+        activation = 'relu'
         self.px_net = models.Sequential([
             layers.Dense(64, activation=activation),
-            layers.Dropout(0.1),
+            layers.Dropout(0.1, seed=config.seed),
             layers.Dense(64, activation=activation),
-            layers.Dropout(0.1),
+            layers.Dropout(0.1, seed=config.seed),
             layers.Dense(1),
         ])
         self.qty_net = models.Sequential([
             layers.Dense(64, activation=activation),
-            layers.Dropout(0.1),
+            layers.Dropout(0.1, seed=config.seed),
             layers.Dense(64, activation=activation),
-            layers.Dropout(0.1),
+            layers.Dropout(0.1, seed=config.seed),
             layers.Dense(1),
         ])
 
@@ -261,18 +260,22 @@ class Discriminator(models.Model):
 
 class ImprovedGAN:
     def __init__(self, raw_data, config):
+        tf.keras.utils.set_random_seed(config.seed)
+
+        batch_size = config.sample_size // config.n_batches
         self.config = config
         self.dataset = create_dataset(
             raw_data=raw_data,
             sample_size=min(len(raw_data), config.sample_size),
-            batch_size=config.sample_size // config.n_batches,
+            batch_size=batch_size,
         )
         self.generator = Generator(config)
         self.discriminator = Discriminator(config)
-        self.gen_optimizer = optimizers.Adam(learning_rate=0.01)
-        self.disc_optimizer = optimizers.Adam(learning_rate=0.01)
+        self.gen_optimizer = optimizers.Adam(learning_rate=0.0001)
+        self.disc_optimizer = optimizers.Adam(learning_rate=0.0001)
         self.fixed_noise = tf.random.normal(
-            [N_FIXED_NOISE, Z_DIM],
+            [batch_size, Z_DIM],
+            seed=config.seed,
         )
         self.generated_lobs = []
         self.metrics = []
@@ -280,10 +283,30 @@ class ImprovedGAN:
     @tf.function
     def train_step(self, real_lobs, epoch) -> dict:
         n_samples = tf.shape(real_lobs)[0]
-        noise = tf.random.normal(
-            shape=[n_samples, Z_DIM],
-        )
-        with tf.GradientTape() as gen_tape, tf.GradientTape() as disc_tape:
+
+        with tf.GradientTape() as gen_tape:
+            noise = tf.random.normal(
+                shape=[n_samples * 2, Z_DIM],
+                seed=self.config.seed,
+            )
+            fake_lobs = self.generator(noise)
+            fake_output = self.discriminator(fake_lobs)
+            adv_loss = tf.reduce_mean(losses.binary_crossentropy(
+                tf.ones_like(fake_output), fake_output, from_logits=True))
+            fm_loss = self.config.fm_multiplier * \
+                calculate_feature_matching_loss(real_lobs, fake_lobs)
+            gen_loss = adv_loss + fm_loss
+
+        gen_gradients = gen_tape.gradient(
+            gen_loss, self.generator.trainable_variables)
+        self.gen_optimizer.apply_gradients(
+            zip(gen_gradients, self.generator.trainable_variables))
+
+        with tf.GradientTape() as disc_tape:
+            noise = tf.random.normal(
+                shape=[n_samples, Z_DIM],
+                seed=self.config.seed,
+            )
             fake_lobs = self.generator(noise)
             real_output = self.discriminator(real_lobs)
             fake_output = self.discriminator(fake_lobs)
@@ -296,63 +319,46 @@ class ImprovedGAN:
                 fake_labels, fake_output, from_logits=True))
             disc_loss = real_loss + fake_loss
 
-            adv_loss = tf.reduce_mean(losses.binary_crossentropy(
-                tf.ones_like(fake_output), fake_output, from_logits=True))
-            fm_loss = tf.math.log(1 + epoch) * self.config.fm_multiplier * \
-                calculate_feature_matching_loss(real_lobs, fake_lobs)
-            gen_loss = adv_loss + fm_loss
-
-            fake_sample_stats = calculate_sample_stats(fake_lobs)
-
         disc_gradients = disc_tape.gradient(
             disc_loss, self.discriminator.trainable_variables)
         self.disc_optimizer.apply_gradients(
             zip(disc_gradients, self.discriminator.trainable_variables))
 
-        gen_gradients = gen_tape.gradient(
-            gen_loss, self.generator.trainable_variables)
-        self.gen_optimizer.apply_gradients(
-            zip(gen_gradients, self.generator.trainable_variables))
-
-        real_output = self.discriminator(real_lobs)
-        fake_output = self.discriminator(self.generator(noise))
-        real_prob = tf.reduce_mean(tf.sigmoid(real_output))
-        fake_prob = tf.reduce_mean(tf.sigmoid(fake_output))
         return dict(
             disc_loss=disc_loss,
+            real_loss=real_loss,
+            fake_loss=fake_loss,
             gen_loss=gen_loss,
             adv_loss=adv_loss,
             fm_loss=fm_loss,
-            real_prob=real_prob,
-            fake_prob=fake_prob,
-            **fake_sample_stats,
+            real_prob=tf.reduce_mean(tf.sigmoid(real_output)),
+            fake_prob=tf.reduce_mean(tf.sigmoid(fake_output)),
         )
 
     def train(self):
-        g1 = self.generator.predict(self.fixed_noise, verbose=False)
-        g2 = self.generator.predict(self.fixed_noise, verbose=False)
-        assert tf.reduce_all(g1 == g2)
-
         start_time = time.time()
 
-        for epoch in tqdm(range(self.config.epochs)):
-            self.generated_lobs.append(
-                self.generator.predict(self.fixed_noise, verbose=False))
+        self.generated_lobs.append(
+            self.generator.predict(self.fixed_noise, verbose=False))
 
+        for epoch in tqdm(range(self.config.epochs)):
             epoch_metrics_list = []
             for batch in self.dataset:
-                batch = tf.identity(batch)  # move to gpu
                 metrics = self.train_step(
                     batch, tf.constant(epoch, dtype=tf.float32))
                 metrics = {k: float(v) for k, v in metrics.items()}
                 # insert historical averaging here
                 epoch_metrics_list.append(metrics)
 
-            epoch_metrics = pd.DataFrame(epoch_metrics_list).mean()
+            fake_batch = self.generator.predict(self.fixed_noise,
+                                                verbose=False)
+            self.generated_lobs.append(fake_batch)
+            sample_stats = calculate_sample_stats(fake_batch)
+            epoch_metrics = dict(
+                pd.DataFrame(epoch_metrics_list).mean(),
+                **sample_stats,
+            )
             self.metrics.append(epoch_metrics)
-
-        self.generated_lobs.append(
-            self.generator.predict(self.fixed_noise, verbose=False))
 
         total_time = time.time() - start_time
         print(f'Training completed in {total_time/60:.2f} minutes')
