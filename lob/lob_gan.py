@@ -29,17 +29,17 @@ QUANTITY_FEATURES = (
 @dataclass
 class Configs:
     fm_multiplier: float = 0.0
+    use_handmade_features: bool = True
+    use_extracted_features: bool = True
     historical_averaging_weight: float = 0.0001
     use_minibatch_discrimination: bool = False
     label_smoothing: float = 0.0
 
+    z_dim = 64
     sample_size: int = 20_000
     n_batches: int = 16
     epochs: int = 64
     seed: int = 0
-
-
-Z_DIM = 128
 
 
 def create_dataset(raw_data, sample_size, batch_size,
@@ -128,7 +128,7 @@ def plot_training_history(metrics: pd.DataFrame):
     plot_cols(axes[1], ['disc_loss', 'real_loss', 'fake_loss'], True)
     plot_cols(axes[2], ['real_prob', 'fake_prob'])
     plot_cols(axes[3], ['neg_qty_sum', 'neg_diff_sum'], True)
-    plot_cols(axes[4], ['neg_qty_count', 'neg_diff_count'], True)
+    plot_cols(axes[4], ['neg_qty_count', 'neg_diff_count'])
     plt.tight_layout()
     plt.show()
 
@@ -165,56 +165,11 @@ def calculate_sample_stats(batch) -> dict:
     )
 
 
-def calculate_feature_matching_loss(real_lobs, fake_lobs):
-
-    def calc_neg_px_diff_sums(lobs):
-        prices = lobs[:, :2*N_LOB_LEVELS]
-        price_diffs = prices[:, 1:] - prices[:, :-1]
-        price_diffs = (
-            tf.expand_dims(prices, axis=1) - tf.expand_dims(prices, axis=2)
-        )
-        price_diffs = tf.linalg.band_part(price_diffs, 0, -1)
-        return tf.reduce_sum(tf.nn.relu(-price_diffs))
-
-    def calc_neg_qty_sums(lobs):
-        quantities = lobs[:, 2*N_LOB_LEVELS:]
-        return tf.reduce_sum(tf.nn.relu(-quantities))
-
-    def calc_px_stats(lobs):
-        prices = lobs[:, :2*N_LOB_LEVELS]
-        return (
-            tf.reduce_mean(tf.math.reduce_variance(
-                prices[N_LOB_LEVELS:], axis=1)),
-            tf.reduce_mean(tf.math.reduce_variance(
-                prices[:N_LOB_LEVELS], axis=1)),
-            tf.reduce_max(prices) - tf.reduce_min(prices),
-        )
-
-    def calc_qty_stats(lobs):
-        qtys = lobs[:, 2*N_LOB_LEVELS:]
-        return (
-            tf.reduce_mean(tf.math.reduce_variance(
-                qtys[N_LOB_LEVELS:], axis=1)),
-            tf.reduce_mean(tf.math.reduce_variance(
-                qtys[:N_LOB_LEVELS], axis=1)),
-            tf.reduce_max(qtys) - tf.reduce_min(qtys),
-        )
-
-    def calc_stats(lobs):
-        return tf.stack([
-            calc_neg_px_diff_sums(lobs),
-            calc_neg_qty_sums(lobs),
-            *calc_px_stats(lobs),
-            *calc_qty_stats(lobs),
-        ])
-
-    return tf.norm(calc_stats(real_lobs) - calc_stats(fake_lobs))
-
-
 class Generator(models.Model):
     def __init__(self, config):
         super().__init__()
         activation = 'relu'
+        self.config = config
         self.px_net = models.Sequential([
             layers.Dense(64, activation=activation, use_bias=False),
             layers.Dense(64, activation=activation, use_bias=False),
@@ -223,20 +178,46 @@ class Generator(models.Model):
         self.qty_net = models.Sequential([
             layers.Dense(64, activation=activation, use_bias=False),
             layers.Dense(64, activation=activation, use_bias=False),
-            layers.Dense(N_LOB_LEVELS * 2, use_bias=False),
+            layers.Dense(N_LOB_LEVELS * 2, use_bias=True),
         ])
 
     def call(self, inputs):
-        x_price = inputs[:, :Z_DIM // 2]
-        x_qty = inputs[:, Z_DIM // 2:]
+        x_price = inputs[:, :self.config.z_dim // 2]
+        x_qty = inputs[:, self.config.z_dim // 2:]
         x_price = self.px_net(x_price)
         x_qty = self.qty_net(x_qty)
         return tf.concat([x_price, x_qty], axis=1)
 
 
+# column vector of summary statistics for the batch
+def _calculate_handmade_features(lobs):
+    prices = lobs[:, :2*N_LOB_LEVELS]
+    # price_diffs = prices[:, 1:] - prices[:, :-1]
+    price_diffs = (
+        tf.expand_dims(prices, axis=1) - tf.expand_dims(prices, axis=2)
+    )
+    price_diffs = tf.linalg.band_part(price_diffs, 0, -1)
+    qtys = lobs[:, 2*N_LOB_LEVELS:]
+
+    return [
+        tf.reduce_sum(tf.nn.softplus(-price_diffs)),
+        tf.reduce_sum(tf.nn.softplus(-qtys)),
+
+        tf.reduce_mean(tf.math.reduce_std(prices, axis=1)),
+        tf.reduce_min(price_diffs),
+        tf.reduce_max(price_diffs),
+
+        tf.reduce_mean(tf.math.reduce_mean(qtys, axis=1)),
+        tf.reduce_mean(tf.math.reduce_std(qtys, axis=1)),
+        tf.reduce_min(qtys),
+        tf.reduce_max(qtys),
+    ]
+
+
 class Discriminator(models.Model):
     def __init__(self, config):
         super().__init__()
+        self.config = config
         activation = 'relu'
         self.px_layers = [
             layers.Dense(64, activation=activation),
@@ -254,17 +235,30 @@ class Discriminator(models.Model):
         ]
 
     def call(self, inputs):
-        features = []
+        if self.config.use_handmade_features:
+            features_list = _calculate_handmade_features(inputs)
+        else:
+            features_list = []
 
         x_price = inputs[:, :2 * N_LOB_LEVELS]
         for layer in self.px_layers:
             x_price = layer(x_price)
+            if self.config.use_extracted_features and isinstance(layer, layers.Dropout):
+                features_list.append(tf.reduce_mean(x_price))
+                features_list.append(tf.reduce_mean(
+                    tf.math.reduce_std(x_price, axis=1)))
 
         x_qty = inputs[:, 2 * N_LOB_LEVELS:]
         for layer in self.qty_layers:
             x_qty = layer(x_qty)
+            if self.config.use_extracted_features and isinstance(layer, layers.Dropout):
+                features_list.append(tf.reduce_mean(x_qty))
+                features_list.append(tf.reduce_mean(
+                    tf.math.reduce_std(x_qty, axis=1)))
 
         prediction = tf.squeeze(x_price + x_qty)
+        features = tf.stack(features_list)
+
         return prediction, features
 
 
@@ -308,28 +302,32 @@ class ImprovedGAN:
         )
         self.generator = Generator(config)
         self.discriminator = Discriminator(config)
-        self.gen_optimizer = optimizers.Adam(learning_rate=0.0001)
-        self.disc_optimizer = optimizers.Adam(learning_rate=0.0001)
+        self.gen_optimizer = optimizers.AdamW(learning_rate=0.0001)
+        self.disc_optimizer = optimizers.AdamW(learning_rate=0.0001)
         self.fixed_noise = tf.random.normal(
-            [batch_size, Z_DIM],
+            [batch_size, config.z_dim],
             seed=config.seed,
         )
+        self.step = 0
 
     @tf.function
-    def train_step(self, real_lobs, epoch) -> dict:
+    def train_step(self, real_lobs) -> dict:
+        self.step += 1
         n_samples = tf.shape(real_lobs)[0]
 
+        noise = tf.random.normal(
+            shape=[n_samples * 2, self.config.z_dim],
+            seed=self.config.seed + self.step,
+        )
+
         with tf.GradientTape() as gen_tape:
-            noise = tf.random.normal(
-                shape=[n_samples * 2, Z_DIM],
-                seed=self.config.seed,
-            )
             fake_lobs = self.generator(noise)
+            real_output, real_feats = self.discriminator(real_lobs)
             fake_output, fake_feats = self.discriminator(fake_lobs)
             adv_loss = tf.reduce_mean(losses.binary_crossentropy(
                 tf.ones_like(fake_output), fake_output, from_logits=True))
             fm_loss = self.config.fm_multiplier * \
-                calculate_feature_matching_loss(real_lobs, fake_lobs)
+                tf.norm(real_feats - fake_feats)
             gen_loss = adv_loss + fm_loss
 
         gen_gradients = gen_tape.gradient(
@@ -338,13 +336,9 @@ class ImprovedGAN:
             zip(gen_gradients, self.generator.trainable_variables))
 
         with tf.GradientTape() as disc_tape:
-            noise = tf.random.normal(
-                shape=[n_samples, Z_DIM],
-                seed=self.config.seed,
-            )
             fake_lobs = self.generator(noise)
-            real_output, real_feats = self.discriminator(real_lobs)
-            fake_output, fake_feats = self.discriminator(fake_lobs)
+            real_output, _ = self.discriminator(real_lobs)
+            fake_output, _ = self.discriminator(fake_lobs)
             real_labels = tf.ones_like(real_output)
             fake_labels = tf.zeros_like(fake_output)
 
@@ -381,8 +375,7 @@ class ImprovedGAN:
         for epoch in tqdm(range(self.config.epochs)):
             epoch_metrics_list = []
             for batch in self.dataset:
-                metrics = self.train_step(
-                    batch, tf.constant(epoch, dtype=tf.float32))
+                metrics = self.train_step(batch)
                 metrics = {k: float(v) for k, v in metrics.items()}
                 # insert historical averaging here
                 epoch_metrics_list.append(metrics)
