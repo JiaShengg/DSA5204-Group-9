@@ -110,14 +110,13 @@ def plot_lobs(all_lobs):
         plt.show()
 
 
-def plot_training_history(metrics):
+def plot_training_history(metrics: pd.DataFrame):
     print('plot_training_history')
-    metrics_df = pd.DataFrame(metrics)
-    display(metrics_df)  # type: ignore
+    display(metrics)  # type: ignore
     _, axes = plt.subplots(nrows=5, figsize=(6, 14), sharex=True)
 
     def plot_cols(ax, cols, log_scale=False):
-        metrics_df[cols].plot(ax=ax, drawstyle='steps-post')
+        metrics[cols].plot(ax=ax, drawstyle='steps-post')
         if log_scale:
             ax.set_yscale('log')
 
@@ -277,8 +276,6 @@ class ImprovedGAN:
             [batch_size, Z_DIM],
             seed=config.seed,
         )
-        self.generated_lobs = []
-        self.metrics = []
 
     @tf.function
     def train_step(self, real_lobs, epoch) -> dict:
@@ -335,11 +332,13 @@ class ImprovedGAN:
             fake_prob=tf.reduce_mean(tf.sigmoid(fake_output)),
         )
 
-    def train(self):
+    def train(self) -> tuple[list, pd.DataFrame]:
         start_time = time.time()
+        lobs_list = []
+        metrics_list = []
 
-        self.generated_lobs.append(
-            self.generator.predict(self.fixed_noise, verbose=False))
+        lobs_list.append(self.generator.predict(
+            self.fixed_noise, verbose=False))
 
         for epoch in tqdm(range(self.config.epochs)):
             epoch_metrics_list = []
@@ -350,19 +349,20 @@ class ImprovedGAN:
                 # insert historical averaging here
                 epoch_metrics_list.append(metrics)
 
-            fake_batch = self.generator.predict(self.fixed_noise,
-                                                verbose=False)
-            self.generated_lobs.append(fake_batch)
+            fake_batch = self.generator.predict(
+                self.fixed_noise, verbose=False)
+            lobs_list.append(fake_batch)
             sample_stats = calculate_sample_stats(fake_batch)
             epoch_metrics = dict(
                 pd.DataFrame(epoch_metrics_list).mean(),
                 **sample_stats,
             )
-            self.metrics.append(epoch_metrics)
+            metrics_list.append(epoch_metrics)
 
         total_time = time.time() - start_time
         print(f'Training completed in {total_time/60:.2f} minutes')
-        return self.generated_lobs, self.metrics
+        all_metrics = pd.DataFrame(metrics_list)
+        return lobs_list, all_metrics
 
 
 print(f'imported at {datetime.datetime.now()}')
