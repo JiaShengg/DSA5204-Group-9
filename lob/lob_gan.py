@@ -1,6 +1,10 @@
+from __future__ import annotations
+
 import datetime
 import time
 from dataclasses import dataclass
+from pathlib import Path
+
 
 import pandas as pd
 import numpy as np
@@ -257,6 +261,33 @@ class Discriminator(models.Model):
         return tf.squeeze(x_price + x_qty)
 
 
+@dataclass(eq=False, frozen=True, slots=True)
+class TrainingOutputs:
+    metrics: pd.DataFrame
+    lobs: list[np.ndarray]
+
+    def dump(self, path: Path) -> None:
+        path.mkdir(exist_ok=True)
+        self.metrics.to_parquet(path / f'metrics.parq')
+        for i, lob in enumerate(self.lobs):
+            np.save(path / f'lob-{i:03}.npy', lob)
+
+    @staticmethod
+    def load(path: Path) -> TrainingOutputs:
+        return TrainingOutputs(
+            metrics=pd.read_parquet(path / f'metrics.parq'),
+            lobs=[np.load(p) for p in sorted(path.glob('*.npy'))],
+        )
+
+    def __eq__(self, rhs) -> bool:
+        if (self.metrics != rhs.metrics).any(axis=None):
+            return False
+        for l, r in zip(self.lobs, rhs.lobs):
+            if (l != r).any():
+                return False
+        return True
+
+
 class ImprovedGAN:
     def __init__(self, raw_data, config):
         tf.keras.utils.set_random_seed(config.seed)
@@ -332,7 +363,7 @@ class ImprovedGAN:
             fake_prob=tf.reduce_mean(tf.sigmoid(fake_output)),
         )
 
-    def train(self) -> tuple[list, pd.DataFrame]:
+    def train(self) -> TrainingOutputs:
         start_time = time.time()
         lobs_list = []
         metrics_list = []
@@ -362,7 +393,7 @@ class ImprovedGAN:
         total_time = time.time() - start_time
         print(f'Training completed in {total_time/60:.2f} minutes')
         all_metrics = pd.DataFrame(metrics_list)
-        return lobs_list, all_metrics
+        return TrainingOutputs(metrics=all_metrics, lobs=lobs_list)
 
 
 print(f'imported at {datetime.datetime.now()}')
