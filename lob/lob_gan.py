@@ -238,27 +238,34 @@ class Discriminator(models.Model):
     def __init__(self, config):
         super().__init__()
         activation = 'relu'
-        self.px_net = models.Sequential([
+        self.px_layers = [
             layers.Dense(64, activation=activation),
             layers.Dropout(0.1, seed=config.seed),
             layers.Dense(64, activation=activation),
             layers.Dropout(0.1, seed=config.seed),
             layers.Dense(1),
-        ])
-        self.qty_net = models.Sequential([
+        ]
+        self.qty_layers = [
             layers.Dense(64, activation=activation),
             layers.Dropout(0.1, seed=config.seed),
             layers.Dense(64, activation=activation),
             layers.Dropout(0.1, seed=config.seed),
             layers.Dense(1),
-        ])
+        ]
 
     def call(self, inputs):
+        features = []
+
         x_price = inputs[:, :2 * N_LOB_LEVELS]
+        for layer in self.px_layers:
+            x_price = layer(x_price)
+
         x_qty = inputs[:, 2 * N_LOB_LEVELS:]
-        x_price = self.px_net(x_price)
-        x_qty = self.qty_net(x_qty)
-        return tf.squeeze(x_price + x_qty)
+        for layer in self.qty_layers:
+            x_qty = layer(x_qty)
+
+        prediction = tf.squeeze(x_price + x_qty)
+        return prediction, features
 
 
 @dataclass(eq=False, frozen=True, slots=True)
@@ -318,7 +325,7 @@ class ImprovedGAN:
                 seed=self.config.seed,
             )
             fake_lobs = self.generator(noise)
-            fake_output = self.discriminator(fake_lobs)
+            fake_output, fake_feats = self.discriminator(fake_lobs)
             adv_loss = tf.reduce_mean(losses.binary_crossentropy(
                 tf.ones_like(fake_output), fake_output, from_logits=True))
             fm_loss = self.config.fm_multiplier * \
@@ -336,8 +343,8 @@ class ImprovedGAN:
                 seed=self.config.seed,
             )
             fake_lobs = self.generator(noise)
-            real_output = self.discriminator(real_lobs)
-            fake_output = self.discriminator(fake_lobs)
+            real_output, real_feats = self.discriminator(real_lobs)
+            fake_output, fake_feats = self.discriminator(fake_lobs)
             real_labels = tf.ones_like(real_output)
             fake_labels = tf.zeros_like(fake_output)
 
