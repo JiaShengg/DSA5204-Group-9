@@ -363,8 +363,10 @@ class ImprovedGAN:
                 fake_output, fake_h_feats, fake_e_feats = self.discriminator(
                     fake_lobs)
 
-                adv_loss += 10 * tf.reduce_mean(losses.binary_crossentropy(
-                    ones, fake_output, from_logits=True))
+                adv_loss += tf.reduce_mean(losses.binary_crossentropy(
+                    ones, fake_output, from_logits=True,
+                    label_smoothing=self.config.label_smoothing,
+                ))
                 fm_loss_h += self.config.fm_weight_h * \
                     tf.norm(real_h_feats - fake_h_feats)
                 fm_loss_e += self.config.fm_weight_h * \
@@ -388,9 +390,13 @@ class ImprovedGAN:
             fake_output, _, _ = self.discriminator(fake_lobs)
 
             real_loss = tf.reduce_mean(losses.binary_crossentropy(
-                ones, real_output, from_logits=True))
+                ones, real_output, from_logits=True,
+                label_smoothing=self.config.label_smoothing,
+            ))
             fake_loss = tf.reduce_mean(losses.binary_crossentropy(
-                zeros, fake_output, from_logits=True))
+                zeros, fake_output, from_logits=True,
+                label_smoothing=self.config.label_smoothing,
+            ))
             disc_loss = real_loss + fake_loss
 
         disc_gradients = disc_tape.gradient(
