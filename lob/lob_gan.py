@@ -342,6 +342,9 @@ class ImprovedGAN:
     def train_step(self, real_lobs) -> dict:
         n_samples = tf.shape(real_lobs)[0]
 
+        ones = tf.ones(n_samples)
+        zeros = tf.ones(n_samples)
+
         with tf.GradientTape() as gen_tape:
             adv_loss = 0
             fm_loss_h = 0
@@ -361,7 +364,7 @@ class ImprovedGAN:
                     fake_lobs)
 
                 adv_loss += 10 * tf.reduce_mean(losses.binary_crossentropy(
-                    tf.ones_like(fake_output), fake_output, from_logits=True))
+                    ones, fake_output, from_logits=True))
                 fm_loss_h += self.config.fm_weight_h * \
                     tf.norm(real_h_feats - fake_h_feats)
                 fm_loss_e += self.config.fm_weight_h * \
@@ -383,13 +386,11 @@ class ImprovedGAN:
             fake_lobs = self.generator(noise)
             real_output, _, _ = self.discriminator(real_lobs)
             fake_output, _, _ = self.discriminator(fake_lobs)
-            real_labels = tf.ones_like(real_output)
-            fake_labels = tf.zeros_like(fake_output)
 
             real_loss = tf.reduce_mean(losses.binary_crossentropy(
-                real_labels, real_output, from_logits=True))
+                ones, real_output, from_logits=True))
             fake_loss = tf.reduce_mean(losses.binary_crossentropy(
-                fake_labels, fake_output, from_logits=True))
+                zeros, fake_output, from_logits=True))
             disc_loss = real_loss + fake_loss
 
         disc_gradients = disc_tape.gradient(
