@@ -34,6 +34,8 @@ class Configs:
     historical_averaging_weight: float = 0.0001
     use_minibatch_discrimination: bool = False
     label_smoothing: float = 0.0
+    gen_lr: float = 0.0001
+    disc_lr: float = 0.0001
 
     z_dim = 64
     sample_size: int = 20_000
@@ -302,8 +304,8 @@ class ImprovedGAN:
         )
         self.generator = Generator(config)
         self.discriminator = Discriminator(config)
-        self.gen_optimizer = optimizers.AdamW(learning_rate=0.0001)
-        self.disc_optimizer = optimizers.AdamW(learning_rate=0.0001)
+        self.gen_optimizer = optimizers.AdamW(learning_rate=config.gen_lr)
+        self.disc_optimizer = optimizers.AdamW(learning_rate=config.disc_lr)
         self.fixed_noise = tf.random.normal(
             [batch_size, config.z_dim],
             seed=config.seed,
