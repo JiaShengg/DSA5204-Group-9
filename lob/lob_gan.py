@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import datetime
 import time
-from dataclasses import dataclass
+import hashlib
+import json
+from dataclasses import dataclass, asdict
 from pathlib import Path
-
 
 import pandas as pd
 import numpy as np
@@ -26,23 +27,34 @@ QUANTITY_FEATURES = (
 )
 
 
-@dataclass
-class Configs:
+@dataclass(frozen=True)
+class Config:
+    gen_lr: float = 0.001
+    disc_lr: float = 0.001
+    z_dim: int = 64
+    n_batches: int = 16
+
     fm_weight_h: float = 0.0  # handmade features
     fm_weight_e: float = 0.0  # extracted features
-
-    historical_averaging_weight: float = 0.0001
-    use_minibatch_discrimination: bool = False
+    use_minibatch_discrimination: bool = False  # minibatch discrimination
     label_smoothing: float = 0.0
 
-    gen_lr: float = 0.001
-    disc_lr: float = 0.0001
-
-    z_dim = 64
     sample_size: int = 20_000
-    n_batches: int = 16
     epochs: int = 64
     seed: int = 0
+
+    def to_json(self, **kwargs) -> str:
+        d = dict(sorted(asdict(self).items()))
+        return json.dumps(d, **kwargs)
+
+    @staticmethod
+    def from_json(s: str) -> Config:
+        loaded = json.loads(s)
+        return Config(**loaded)
+
+    def get_key(self) -> str:
+        json_str = self.to_json()
+        return hashlib.sha256(json_str.encode('utf-8')).hexdigest()
 
 
 def create_dataset(raw_data, sample_size, batch_size,
@@ -170,7 +182,7 @@ def calculate_sample_stats(batch) -> dict:
 
 
 class Generator(models.Model):
-    def __init__(self, config):
+    def __init__(self, config: Config):
         super().__init__()
         activation = 'relu'
         self.config = config
@@ -233,7 +245,7 @@ class MinibatchDiscrimination(layers.Layer):
 
 
 class Discriminator(models.Model):
-    def __init__(self, config):
+    def __init__(self, config: Config):
         super().__init__()
         self.config = config
         activation = 'relu'
@@ -296,9 +308,9 @@ class TrainingOutputs:
 
     def dump(self, path: Path) -> None:
         path.mkdir(exist_ok=True)
-        self.metrics.to_parquet(path / f'metrics.parq')
         for i, lob in enumerate(self.lobs):
             np.save(path / f'lob-{i:03}.npy', lob)
+        self.metrics.to_parquet(path / f'metrics.parq')
 
     @staticmethod
     def load(path: Path) -> TrainingOutputs:
@@ -317,7 +329,7 @@ class TrainingOutputs:
 
 
 class ImprovedGAN:
-    def __init__(self, raw_data, config):
+    def __init__(self, raw_data, config: Config):
         tf.keras.utils.set_random_seed(config.seed)
 
         batch_size = config.sample_size // config.n_batches
@@ -342,9 +354,6 @@ class ImprovedGAN:
     def train_step(self, real_lobs) -> dict:
         n_samples = tf.shape(real_lobs)[0]
 
-        ones = tf.ones(n_samples)
-        zeros = tf.ones(n_samples)
-
         with tf.GradientTape() as gen_tape:
             adv_loss = 0
             fm_loss_h = 0
@@ -364,7 +373,8 @@ class ImprovedGAN:
                     fake_lobs)
 
                 adv_loss += tf.reduce_mean(losses.binary_crossentropy(
-                    ones, fake_output, from_logits=True,
+                    tf.ones_like(fake_output), fake_output,
+                    from_logits=True,
                     label_smoothing=self.config.label_smoothing,
                 ))
                 fm_loss_h += self.config.fm_weight_h * \
@@ -386,15 +396,18 @@ class ImprovedGAN:
             )
             self.step += 1
             fake_lobs = self.generator(noise)
-            real_output, _, _ = self.discriminator(real_lobs)
-            fake_output, _, _ = self.discriminator(fake_lobs)
 
+            real_output, _, _ = self.discriminator(real_lobs)
             real_loss = tf.reduce_mean(losses.binary_crossentropy(
-                ones, real_output, from_logits=True,
+                tf.ones_like(real_output), real_output,
+                from_logits=True,
                 label_smoothing=self.config.label_smoothing,
             ))
+
+            fake_output, _, _ = self.discriminator(fake_lobs)
             fake_loss = tf.reduce_mean(losses.binary_crossentropy(
-                zeros, fake_output, from_logits=True,
+                tf.zeros_like(fake_output), fake_output,
+                from_logits=True,
                 label_smoothing=self.config.label_smoothing,
             ))
             disc_loss = real_loss + fake_loss
