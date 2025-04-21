@@ -342,8 +342,8 @@ class ImprovedGAN:
         )
         self.generator = Generator(config)
         self.discriminator = Discriminator(config)
-        self.gen_optimizer = optimizers.AdamW(learning_rate=config.gen_lr)
-        self.disc_optimizer = optimizers.AdamW(learning_rate=config.disc_lr)
+        self.gen_optimizer = optimizers.Adam(learning_rate=config.gen_lr)
+        self.disc_optimizer = optimizers.Adam(learning_rate=config.disc_lr)
         self.fixed_noise = tf.random.normal(
             [batch_size, config.z_dim],
             seed=config.seed,
