@@ -333,7 +333,7 @@ class ImprovedGAN:
         tf.keras.utils.set_random_seed(config.seed)
 
         batch_size = config.sample_size // config.n_batches
-        print(f'{batch_size=}')
+
         self.config = config
         self.dataset = create_dataset(
             raw_data=raw_data,
