@@ -217,12 +217,12 @@ def _calculate_handmade_features(prices, qtys):
         tf.reduce_sum(tf.nn.relu(-price_diffs)),
         tf.reduce_sum(tf.nn.relu(-qtys)),
 
-        tf.reduce_mean(tf.math.reduce_std(prices, axis=1)),
+        tf.reduce_mean(tf.math.reduce_variance(prices, axis=1)),
         tf.reduce_min(price_diffs),
         tf.reduce_max(price_diffs),
 
         tf.reduce_mean(tf.math.reduce_mean(qtys, axis=1)),
-        tf.reduce_mean(tf.math.reduce_std(qtys, axis=1)),
+        tf.reduce_mean(tf.math.reduce_variance(qtys, axis=1)),
         tf.reduce_min(qtys),
         tf.reduce_max(qtys),
     ], axis=0)
@@ -253,7 +253,7 @@ class Discriminator(models.Model):
         if config.use_minibatch_discrimination:
             FeatureLayer = MinibatchDiscrimination
         else:
-            FeatureLayer = layers.Identity
+            FeatureLayer = lambda **kwargs: layers.Lambda(lambda x: x, **kwargs)
 
         self.px_layers = [
             layers.Dense(64, activation=activation),
