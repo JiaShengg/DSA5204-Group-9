@@ -301,7 +301,7 @@ class Discriminator(models.Model):
         return prediction, handmade_features, extracted_features
 
 
-@dataclass(eq=False, frozen=True, slots=True)
+@dataclass(eq=False, frozen=True)
 class TrainingOutputs:
     metrics: pd.DataFrame
     lobs: list[np.ndarray]
