@@ -324,6 +324,35 @@ def compare_models(output_root: Path):
 
     print("Exported all comparison plots to 'data_compare'")
 
+def plot_raw_lob_snapshot(lob_row, ax=None):
+    N = 5  # number of levels
+    price_cols = [f"b{i}p" for i in range(N)] + [f"a{i}p" for i in range(N)]
+    qty_cols   = [f"b{i}q" for i in range(N)] + [f"a{i}q" for i in range(N)]
+
+    prices = lob_row[price_cols].values
+    quantities = lob_row[qty_cols].values
+
+    bidp = prices[:N]
+    askp = prices[N:]
+    bidq = quantities[:N]
+    askq = quantities[N:]
+
+    if ax is None:
+        fig, ax = plt.subplots(figsize=(4, 4))
+
+    ax.plot(bidp, bidq, c='green', marker='x', alpha=0.6)
+    ax.plot(askp, askq, c='red', marker='x', alpha=0.6)
+
+    for i, (p, q) in enumerate(zip(bidp, bidq)):
+        ax.annotate(f"b{i}", (p, q), color='green', fontsize=8, ha='right')
+    for i, (p, q) in enumerate(zip(askp, askq)):
+        ax.annotate(f"a{i}", (p, q), color='red', fontsize=8, ha='left')
+
+    ax.vlines(prices, 0, quantities, color='gray', alpha=0.2)
+    ax.axhline(0, color='black', linewidth=0.5, linestyle='--')
+    ax.set_yscale("symlog", linthresh=1e-3)
+    ax.grid(True)
+    return ax
 
 
 def main():
