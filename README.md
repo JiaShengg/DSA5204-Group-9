@@ -14,9 +14,8 @@ This project is a collaborative effort by Group 9 for DSA5204, focusing on repro
 
 ### Group 2: Limit Order Book (LOB) Synthesis
 - Extension of GAN techniques to financial data
-- Generation of realistic market data capturing buy/sell order dynamics
+- Generation of market data capturing buy/sell order dynamics
 - Adaptation of GAN architecture for LOB data
-- Evaluation through distributional matching tests
 
 ### Group 3: Transformer-Based GANs
 - Integration of transformer architectures with GANs
