@@ -1,8 +1,19 @@
 # Limit Order Book Extension for GAN
 
-This repository contains the code for the experiment of extending GAN to generate realistic Limit Order Book snippets. Feature Matching, Minibatch Discrimination and Label Smoothing's effect on generated LOB snippets has been explored. 
+This directory contains the code for extending GAN improvements to generate Limit Order Book snapshots.
 
-The code includes an experiment code that allows random generation of hyperparameters, which helps in exploring the optimal hyperparameter value. Each model's configuration and metrics will also be saved. 
-Codes to plot the metrics of each model into images and comparing between models are also included.  
+`lob_gan.py` explores the following GAN improvement techniques:
+* Feature Matching
+* Minibatch Discrimination
+* Label Smoothing
 
-Real life LOB snippet from raw data has been plotted for comparison with generated snippets. 
+`param_search.py` contains code for hyperparameter and logic for
+* saving every model's configurations, traning results, generated LOB samples to ensure reproducibility
+* caching results to avoid retraining models for computational efficiency
+
+Other files:
+* `BTCUSDT-lob.parq`: bitcoin LOB snapshots
+* `ETHUSDT-lob.parq`: ethereum LOB snapshots
+* `Lob_Experiment.ipynb`: runs parameter search and visualises results
+* `lob_gan.ipynb`: trains model and visualises results
+* `raw_lob_snapshot_row0.png`: sample visualisation of LOB snapshot
